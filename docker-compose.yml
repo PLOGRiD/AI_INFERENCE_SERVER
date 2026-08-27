@@ -1,5 +1,6 @@
 services:
   api:
+    image: ${DOCKERHUB_USERNAME:-plogrid}/plogrid-ai:latest
     build: .
     ports:
       - "8000:8000"
