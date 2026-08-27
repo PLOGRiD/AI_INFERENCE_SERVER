@@ -20,7 +20,7 @@ class NIRPredictor:
     def __init__(self):
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         ckpt_path = hf_hub_download(repo_id=REPO_ID, filename=MODEL_FILENAME, local_dir=str(CACHE_DIR))
-        ck = torch.load(ckpt_path, weights_only=False)
+        ck = torch.load(ckpt_path, weights_only=False, map_location="cpu")
 
         self.enc = SpectralEncoder(18, (64, 32), 2, 0.3)
         self.enc.load_state_dict(ck["encoder"])
