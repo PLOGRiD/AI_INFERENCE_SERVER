@@ -53,6 +53,7 @@ jobs:
           key: ${{ secrets.SECRET_KEY }}
           script: |
             cd ${{ env.APP_PATH }}
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/plogrid-ai:latest
-            docker compose up -d --no-deps worker
+            docker compose down
+            docker compose pull worker
+            docker compose up -d
             docker image prune -f
