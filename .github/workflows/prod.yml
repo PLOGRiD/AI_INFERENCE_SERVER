@@ -1,8 +1,8 @@
-name: deploy
+name: deploy to prod
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "prod" ]
   workflow_dispatch:
 
 jobs:

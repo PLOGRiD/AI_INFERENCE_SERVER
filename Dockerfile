@@ -15,10 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py pipeline.py ./
 COPY yolo_app ./yolo_app
 COPY nir_app ./nir_app
+COPY stream_app ./stream_app
 
 ENV YOLO_MODEL_DIR=/app/models
 ENV NIR_MODEL_DIR=/app/models
 
-EXPOSE 8000
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "main.py"]

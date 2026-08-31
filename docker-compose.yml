@@ -1,11 +1,12 @@
 services:
-  api:
+  worker:
     image: ${DOCKERHUB_USERNAME:-plogrid}/plogrid-ai:latest
     build: .
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
     volumes:
       - ./models:/app/models
     environment:
       - YOLO_MODEL_DIR=/app/models
       - NIR_MODEL_DIR=/app/models
+      - REDIS_URL=${REDIS_URL:?REDIS_URL must be set}
+      - REDIS_CONSUMER_NAME=${REDIS_CONSUMER_NAME:?REDIS_CONSUMER_NAME must be set}
