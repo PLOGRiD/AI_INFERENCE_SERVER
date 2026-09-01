@@ -48,6 +48,7 @@ class StreamConsumer:
 
     async def _run(self) -> None:
         await self._ensure_group()
+        await self._recover_pending()
         logger.info(
             "Redis Streams consumer started (stream=%s group=%s consumer=%s)",
             REQUEST_STREAM, CONSUMER_GROUP, CONSUMER_NAME,
@@ -63,9 +64,13 @@ class StreamConsumer:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Redis Streams 읽기 실패, %d초 후 재시도", RECONNECT_DELAY_S)
-                await asyncio.sleep(RECONNECT_DELAY_S)
+            except Exception as e:
+                if "NOGROUP" in str(e):
+                    logger.warning("스트림/컨슈머 그룹이 사라짐, 다시 생성 시도")
+                    await self._ensure_group()
+                else:
+                    logger.exception("Redis Streams 읽기 실패, %d초 후 재시도", RECONNECT_DELAY_S)
+                    await asyncio.sleep(RECONNECT_DELAY_S)
                 continue
 
             if not response:
@@ -87,6 +92,23 @@ class StreamConsumer:
                     return
                 logger.exception("Redis 연결/컨슈머 그룹 생성 실패, %d초 후 재시도", RECONNECT_DELAY_S)
                 await asyncio.sleep(RECONNECT_DELAY_S)
+
+    async def _recover_pending(self) -> None:
+        """이전 실행이 크래시로 죽어서 ACK 못 하고 남긴, 이 컨슈머 이름 앞으로 걸린 메시지를 이어서 처리한다."""
+        while True:
+            response = await self.redis.xreadgroup(
+                groupname=CONSUMER_GROUP,
+                consumername=CONSUMER_NAME,
+                streams={REQUEST_STREAM: "0"},
+                count=BATCH_SIZE,
+            )
+            if not response:
+                return
+            _stream_name, messages = response[0]
+            if not messages:
+                return
+            for record_id, fields in messages:
+                await self._handle(record_id, fields)
 
     async def _handle(self, record_id: str, fields: dict) -> None:
         try:
