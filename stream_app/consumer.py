@@ -21,6 +21,11 @@ BLOCK_MS = 2000
 BATCH_SIZE = 1
 RECONNECT_DELAY_S = 5
 
+CLAIM_IDLE_MS = 40_000
+CLAIM_INTERVAL_S = 30
+MAX_DELIVERIES = 3
+PROCESS_TIMEOUT_S = 20
+
 class StreamConsumer:
     """trash-analysis-requests 스트림을 소비해 YOLO+NIR 분류를 수행하는 컨슈머."""
 
@@ -48,11 +53,13 @@ class StreamConsumer:
 
     async def _run(self) -> None:
         await self._ensure_group()
-        await self._recover_pending()
+        await self._claim_abandoned(0)
         logger.info(
             "Redis Streams consumer started (stream=%s group=%s consumer=%s)",
             REQUEST_STREAM, CONSUMER_GROUP, CONSUMER_NAME,
         )
+        loop = asyncio.get_running_loop()
+        next_claim_at = loop.time() + CLAIM_INTERVAL_S
         while True:
             try:
                 response = await self.redis.xreadgroup(
@@ -73,12 +80,24 @@ class StreamConsumer:
                     await asyncio.sleep(RECONNECT_DELAY_S)
                 continue
 
-            if not response:
-                continue
+            if response:
+                for _stream_name, messages in response:
+                    for record_id, fields in messages:
+                        # _handle()의 xack 자체가 실패하는 등 예상 밖 예외가 나도
+                        # 이 컨슈머 루프(_run) 전체가 죽지 않도록 메시지 단위로 격리한다.
+                        try:
+                            await self._handle(record_id, fields)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "메시지 처리 중 예상 밖 예외, 다음 메시지로 진행 (recordId=%s)", record_id
+                            )
 
-            for _stream_name, messages in response:
-                for record_id, fields in messages:
-                    await self._handle(record_id, fields)
+            now = loop.time()
+            if now >= next_claim_at:
+                await self._claim_abandoned(CLAIM_IDLE_MS)
+                next_claim_at = now + CLAIM_INTERVAL_S
 
     async def _ensure_group(self) -> None:
         while True:
@@ -93,22 +112,48 @@ class StreamConsumer:
                 logger.exception("Redis 연결/컨슈머 그룹 생성 실패, %d초 후 재시도", RECONNECT_DELAY_S)
                 await asyncio.sleep(RECONNECT_DELAY_S)
 
-    async def _recover_pending(self) -> None:
-        """이전 실행이 크래시로 죽어서 ACK 못 하고 남긴, 이 컨슈머 이름 앞으로 걸린 메시지를 이어서 처리한다."""
+    async def _claim_abandoned(self, min_idle_ms: int) -> None:
+        """min_idle_ms 이상 ACK도 재청구도 안 된 메시지를 (누구 소유든) 가져와 처리한다."""
         while True:
-            response = await self.redis.xreadgroup(
-                groupname=CONSUMER_GROUP,
-                consumername=CONSUMER_NAME,
-                streams={REQUEST_STREAM: "0"},
-                count=BATCH_SIZE,
+            _next_id, claimed, _deleted = await self.redis.xautoclaim(
+                REQUEST_STREAM, CONSUMER_GROUP, CONSUMER_NAME,
+                min_idle_time=min_idle_ms, start_id="0-0", count=BATCH_SIZE,
             )
-            if not response:
+            if not claimed:
                 return
-            _stream_name, messages = response[0]
-            if not messages:
-                return
-            for record_id, fields in messages:
-                await self._handle(record_id, fields)
+            for record_id, fields in claimed:
+                # 아래 _handle_claimed()에서 xack 자체가 실패하는 등 예상 밖 예외가 나도
+                # 스윕 루프가 죽지 않도록 메시지 단위로 격리한다 (이 스윕은 _run 안에서 돌기 때문에,
+                # 여기서 죽으면 _run 전체가 멈추고 이후 회수 시도 자체가 사라진다).
+                try:
+                    await self._handle_claimed(record_id, fields)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "회수한 메시지 처리 중 예상 밖 예외, 다음 메시지로 진행 (recordId=%s)", record_id
+                    )
+
+    async def _handle_claimed(self, record_id: str, fields: dict) -> None:
+        """스윕(_claim_abandoned)이 회수한 메시지 하나를 처리한다.
+
+        배달 횟수(times_delivered)를 먼저 확인해서, MAX_DELIVERIES를 넘겼으면
+        poison message로 보고 더 재시도하지 않고 에러로 확정 처리한다.
+        아니면 평소 새 메시지와 동일하게 _handle()로 넘긴다.
+        """
+        pending = await self.redis.xpending_range(
+            REQUEST_STREAM, CONSUMER_GROUP, min=record_id, max=record_id, count=1
+        )
+        times_delivered = pending[0]["times_delivered"] if pending else 1
+        if times_delivered > MAX_DELIVERIES:
+            logger.error(
+                "%d회 재시도 후에도 실패, 포기하고 에러 처리 (recordId=%s ploggingId=%s)",
+                times_delivered, record_id, fields.get("ploggingId"),
+            )
+            await self.producer.publish_error(fields, f"{MAX_DELIVERIES}회 재시도 후에도 처리 실패")
+            await self.redis.xack(REQUEST_STREAM, CONSUMER_GROUP, record_id)
+            return
+        await self._handle(record_id, fields)
 
     async def _handle(self, record_id: str, fields: dict) -> None:
         try:
@@ -130,6 +175,13 @@ class StreamConsumer:
         image = Image.open(io.BytesIO(resp.content)).convert("RGB")
 
         try:
-            return classify_material(image, nir_values, self.yolo_predictor, self.nir_predictor)
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    classify_material, image, nir_values, self.yolo_predictor, self.nir_predictor
+                ),
+                timeout=PROCESS_TIMEOUT_S,
+            )
         except PipelineError as e:
             raise RuntimeError(str(e))
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"AI 처리 {PROCESS_TIMEOUT_S}초 타임아웃")
